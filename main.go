@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/csv"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -11,17 +13,19 @@ import (
 	yaml "gopkg.in/yaml.v3"
 )
 
+type Container struct {
+	Name  string `yaml:"name"`
+	Usage struct {
+		Cpu    string `yaml:"cpu"`
+		Memory string `yaml:"memory"`
+	} `yaml:"usage"`
+}
+
 type ResourceYml struct {
-	ApiVersion string `yaml:"apiVersion"`
-	Containers []struct {
-		Name  string `yaml:"name"`
-		Usage struct {
-			Cpu    string `yaml:"cpu"`
-			Memory string `yaml:"memory"`
-		} `yaml:"usage"`
-	} `yaml:"containers"`
-	Kind     string `yaml:"kind"`
-	Metadata struct {
+	ApiVersion string      `yaml:"apiVersion"`
+	Containers []Container `yaml:"containers"`
+	Kind       string      `yaml:"kind"`
+	Metadata   struct {
 		CreationTimestamp string            `yaml:"creationTimestamp"`
 		Labels            map[string]string `yaml:"labels"`
 		Name              string            `yaml:"name"`
@@ -31,9 +35,23 @@ type ResourceYml struct {
 	Window    string `yaml:"window"`
 }
 
-type FileInfo struct {
-	fileLock sync.Mutex
-	filePtr  *os.File
+type PodMetric struct {
+	PodName     string
+	Namespace   string // Every TAP component has separate namespace, we can map CPU and Memory usage with this
+	Containers  []Container
+	TotalCPU    string
+	TotalMemory string
+}
+
+// we can sum all podMetric per namespace and that will be total CPU and Memory usage of that TAP component ?
+
+type NamespaceCPUMemUsage struct {
+	PodsMetric map[string][]PodMetric // namespace will be key
+	Lock       sync.Mutex
+}
+
+var Namespacemetric = NamespaceCPUMemUsage{
+	PodsMetric: make(map[string][]PodMetric),
 }
 
 func runCmd(args []string) (error, string) {
@@ -63,35 +81,28 @@ func main() {
 
 	wg := new(sync.WaitGroup)
 
-	fmt.Printf("Started CPU-Memory reading\n")
+	fmt.Errorf("Started CPU-Memory reading\n")
 
 	// List all namespaces
 	err, out = runCmd([]string{"get", "ns", "--no-headers", "-o", "custom-columns=:metadata.name"})
 	if err != nil {
-		fmt.Print("ns error: ", err.Error())
+		fmt.Errorf("ns error: ", err.Error())
 		return
 	}
 
 	ns_list := strings.Split(out, "\n")
 
-	file, err := os.OpenFile("cpu_mem_usage2.txt", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
-	if err != nil {
-		fmt.Printf("File creation error: %s\n", err.Error())
-	}
-
-	f := FileInfo{filePtr: file}
-
-	defer file.Close()
-
 	for _, ns := range ns_list {
 		wg.Add(1)
-		go f.pod_list(ns, wg)
+		go pod_list(ns, wg)
 	}
 
 	wg.Wait()
+	printMetrics()
+	writeIntoFile()
 }
 
-func (f *FileInfo) pod_list(ns string, wg *sync.WaitGroup) {
+func pod_list(ns string, wg *sync.WaitGroup) {
 
 	defer wg.Done()
 	var (
@@ -104,7 +115,7 @@ func (f *FileInfo) pod_list(ns string, wg *sync.WaitGroup) {
 	// List all pods in namespace
 	err, out = runCmd([]string{"get", "pods", "-n", ns, "--no-headers", "-o", "custom-columns=:metadata.name"})
 	if err != nil {
-		fmt.Printf("Error-pod: %s", err.Error())
+		fmt.Errorf("Error-pod: %s", err.Error())
 		return
 	}
 
@@ -115,20 +126,20 @@ func (f *FileInfo) pod_list(ns string, wg *sync.WaitGroup) {
 			continue
 		}
 		wg_pod.Add(1)
-		go f.fetch_cpu_mem_usage(pod, ns, wg_pod)
+		go fetch_cpu_mem_usage(pod, ns, wg_pod)
 
 	}
 	wg_pod.Wait()
 }
 
-func (f *FileInfo) fetch_cpu_mem_usage(pod, ns string, wg *sync.WaitGroup) {
+func fetch_cpu_mem_usage(pod, ns string, wg *sync.WaitGroup) {
 
 	defer wg.Done()
 
 	// Fetch podMetrics for pods, it will give metrics per container in given pod
 	err, out := runCmd([]string{"get", "PodMetrics", pod, "-n", ns, "-oyaml"})
 	if err != nil {
-		fmt.Printf("Error-data-fetch: %s", err.Error())
+		fmt.Errorf("Error-data-fetch: %s", err.Error())
 		return
 	}
 
@@ -136,31 +147,81 @@ func (f *FileInfo) fetch_cpu_mem_usage(pod, ns string, wg *sync.WaitGroup) {
 
 	err = yaml.Unmarshal([]byte(out), &resYml)
 	if err != nil {
-		fmt.Printf("Unmarshal error: %s\n", err.Error())
+		fmt.Errorf("Unmarshal error: %s\n", err.Error())
 		return
 	}
 
-	// Fetch podMetric of pod, it will give metric of resource used by pod
-	err, out = runCmd([]string{"get", "PodMetrics", "build-pod-image-fetcher-4wh4l", "-n", "build-service", "--no-headers"})
+	// Fetch podMetric of pod, it will give metric per pod
+	err, out = runCmd([]string{"get", "PodMetrics", pod, "-n", ns, "--no-headers"})
 	if err != nil {
-		fmt.Printf("Error-data-fetch: %s", err.Error())
+		fmt.Errorf("Error-data-fetch: %s", err.Error())
 		return
 	}
 	usageByPod := strings.Split(out, "  ")
 
-	resUsage := ""
-	for _, con := range resYml.Containers {
-		resUsage = resUsage + "Container_name: " + con.Name + "\nCPU: " + con.Usage.Cpu + " Memory: " + con.Usage.Memory + "\n"
+	temp := PodMetric{
+		PodName:     pod,
+		Namespace:   ns,
+		Containers:  resYml.Containers,
+		TotalCPU:    usageByPod[1],
+		TotalMemory: usageByPod[2],
 	}
-	resUsage = resUsage + "Usage_by_pod:: CPU: " + usageByPod[1] + " Memory: " + usageByPod[2] + "\n"
 
-	f.fileLock.Lock()
-	_, err = f.filePtr.WriteString("Namespace: " + ns + ", Pod: " + pod + "\n" + resUsage + "\n")
-	if err != nil {
-		fmt.Printf("File writing error: %s\n", err.Error())
-	}
-	f.fileLock.Unlock()
+	writeToMap(&temp, ns)
 }
 
-// need to check pod with status=completed,
-// need check just after installation also we get status as completed. If yes need to handle that case here.
+func writeToMap(tmp *PodMetric, ns string) {
+
+	Namespacemetric.Lock.Lock()
+	defer Namespacemetric.Lock.Unlock()
+	Namespacemetric.PodsMetric[ns] = append(Namespacemetric.PodsMetric[ns], *tmp)
+}
+
+func printMetrics() {
+	Namespacemetric.Lock.Lock()
+	defer Namespacemetric.Lock.Unlock()
+	fmt.Printf("\nCPU and Memory usage by TAP: %+v\n", Namespacemetric.PodsMetric)
+}
+
+func writeIntoFile() {
+
+	file, err := os.Create("cpu_mem_usage.csv")
+	if err != nil {
+		log.Fatalln("File creation error: %s\n", err.Error())
+	}
+	defer file.Close()
+
+	w := csv.NewWriter(file)
+	defer w.Flush()
+
+	row := []string{"Namespace", "PodName", "ContainerName", "CPU Usage", "Memory Usage"}
+	if err := w.Write(row); err != nil {
+		log.Fatalln("error writing record to file", err)
+		return
+	}
+
+	Namespacemetric.Lock.Lock()
+	defer Namespacemetric.Lock.Unlock()
+	for ns, podMetrics := range Namespacemetric.PodsMetric {
+		row = []string{ns}
+		if err := w.Write(row); err != nil {
+			log.Fatalln("error writing record to file", err)
+			return
+		}
+		for _, podMetric := range podMetrics {
+			row = []string{" ", podMetric.PodName, " ", podMetric.TotalCPU, podMetric.TotalMemory}
+			if err := w.Write(row); err != nil {
+				log.Fatalln("error writing record to file", err)
+				return
+			}
+			for _, container := range podMetric.Containers {
+				row = []string{" ", " ", container.Name, container.Usage.Cpu, container.Usage.Memory}
+				if err := w.Write(row); err != nil {
+					log.Fatalln("error writing record to file", err)
+					return
+				}
+			}
+		}
+
+	}
+}
